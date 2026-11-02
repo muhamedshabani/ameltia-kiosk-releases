@@ -1,0 +1,89 @@
+# Builds a tagged release from the private source and publishes the installer here. Actions on a public repository
+# uses none of the private repository's minutes (source repository: ADR 0035).
+#
+# Start it by hand, only after the tests have passed on that tag in the source repository: this job does not run them.
+# Only people with write access here can start it, and a pull request can neither start it nor read the secret.
+# SOURCE_DEPLOY_KEY is a read-only deploy key of the source repository. Keep source out of this job's logs and artifacts:
+# nothing here uploads anything except the installer, its checksums and stable.json.
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build; the tag v<version> must exist in the source repository"
+        required: true
+      minimum_version:
+        description: "Refuse in-app updates from anything older than this (empty = no floor)"
+        default: ""
+      notes:
+        description: "One line, shown on the Updates screen"
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the version
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Not a version: $VERSION"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: muhamedshabani/ameltia-kiosk
+          ref: refs/tags/v${{ inputs.version }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      # A tag that disagrees with the version builds a program that keeps offering itself as an update, forever.
+      - name: Tag matches the version
+        shell: pwsh
+        run: |
+          [xml]$props = Get-Content Directory.Build.props
+          $inSource = ($props.Project.PropertyGroup.Version | Where-Object { $_ })
+          if ($env:VERSION -ne $inSource) { throw "The tag says $env:VERSION, the source says $inSource" }
+      - name: Publish win-x64
+        shell: bash
+        run: |
+          dotnet tool restore
+          tools/release/publish.sh --skip-tests
+      - name: Compile the installer
+        shell: pwsh
+        env:
+          MINIMUM_VERSION: ${{ inputs.minimum_version }}
+          NOTES: ${{ inputs.notes }}
+        run: tools/release/build-installer.ps1 -Version $env:VERSION -MinimumVersion "$env:MINIMUM_VERSION" -Notes "$env:NOTES"
+      - name: Clean-install test
+        shell: pwsh
+        run: |
+          $payload = Join-Path $env:RUNNER_TEMP 'old-payload'
+          Copy-Item -Recurse "artifacts/ameltia-kiosk-$env:VERSION-win-x64" $payload
+          Set-Content (Join-Path $payload 'old-version.txt') 'old'
+          & (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe') /DAppVersion=0.0.1 "/DPayloadDir=$payload" "/O$env:RUNNER_TEMP" tools/release/ameltia-kiosk.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          tools/release/test-install.ps1 -OldSetup (Join-Path $env:RUNNER_TEMP 'ameltia-kiosk-setup-0.0.1.exe') -NewSetup (Resolve-Path "artifacts/ameltia-kiosk-setup-$env:VERSION.exe")
+      - name: Publish the installer
+        shell: bash
+        run: |
+          setup="artifacts/ameltia-kiosk-setup-$VERSION.exe"
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --title "Ameltia Kiosk $VERSION" --notes "Ameltia Kiosk $VERSION" "$setup" artifacts/SHA256SUMS \
+            || gh release upload "v$VERSION" --repo "$GITHUB_REPOSITORY" --clobber "$setup" artifacts/SHA256SUMS
+      # Uploaded onto a fixed tag and replaced in place: deleting and recreating would leave a moment when every shop's address is a 404.
+      # stable.json goes last, so no shop is told about an installer that is not there yet.
+      - name: Point the channel at it
+        shell: bash
+        run: |
+          cp "artifacts/ameltia-kiosk-setup-$VERSION.exe" artifacts/ameltia-kiosk-setup.exe
+          gh release upload channel-stable --repo "$GITHUB_REPOSITORY" --clobber artifacts/ameltia-kiosk-setup.exe
+          gh release upload channel-stable --repo "$GITHUB_REPOSITORY" --clobber artifacts/stable.json
